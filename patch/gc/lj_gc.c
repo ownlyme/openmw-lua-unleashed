@@ -146,14 +146,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
   GCobj *o;
   while ((o = gcref(*p)) != NULL) {
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
-      GCtab *mt = tabref(gco2ud(o)->metatable);
-      if (mt && !isfinalized(gco2ud(o)) && !lj_meta_fastg(g, mt, MM_gc)) {
-	*p = o->gch.nextgc;  /* Live, no __gc: relink onto g->gc.root, off the walk for life. */
-	setgcrefr(o->gch.nextgc, g->gc.root);
-	setgcref(g->gc.root, o);
-      } else {
-	p = &o->gch.nextgc;  /* Finalizable, already finalized, or no metatable yet: leave it. */
-      }
+      p = &o->gch.nextgc;  /* Nothing to do. */
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
       markfinalized(o);  /* Done, as there's no __gc metamethod. */
       p = &o->gch.nextgc;
@@ -570,9 +563,9 @@ static void gc_finalize(lua_State *L)
     return;
   }
 #endif
-  /* Relink onto g->gc.root, not the udata sublist, so separate() never re-walks it - sweep still frees it. */
-  setgcrefr(o->gch.nextgc, g->gc.root);
-  setgcref(g->gc.root, o);
+  /* Add userdata back to the main userdata list and make it white. */
+  setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
+  setgcref(mainthread(g)->nextgc, o);
   makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
@@ -625,7 +618,7 @@ void lj_gc_freeall(global_State *g)
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
-  size_t udsize;
+  size_t udsize = 0;  /* Finalizer separation moved out of atomic into the incremental sweep (stage 2). */
 
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
@@ -642,9 +635,7 @@ static void atomic(global_State *g, lua_State *L)
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
 
-  udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
-  gc_mark_mmudata(g);  /* Mark them. */
-  udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+  /* Finalizable userdata are now detected incrementally in the sweep phase (see lj_udata_free). */
 
   /* All marking done, clear weak tables. */
   gc_clearweak(g, gcref(g->gc.weak));
@@ -681,11 +672,24 @@ static size_t gc_onestep(lua_State *L)
   case GCSsweepstring: {
     GCSize old = g->gc.total;
     gc_sweepstr(g, &g->str.tab[g->gc.sweepstr++]);  /* Sweep one chain. */
-    if (g->gc.sweepstr > g->str.mask)
-      g->gc.state = GCSsweep;  /* All string hash chains sweeped. */
+    if (g->gc.sweepstr > g->str.mask) {
+      g->gc.state = GCSsweepudata;  /* Sweep userdata before tables, while finalizer metatables are still live. */
+      setmref(g->gc.sweep, &mainthread(g)->nextgc);
+    }
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     return GCSWEEPCOST;
+    }
+  case GCSsweepudata: {  /* Stage 2: sweep the userdata sublist first - lj_udata_free diverts the __gc ones. */
+    GCSize old = g->gc.total;
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
+    lj_assertG(old >= g->gc.total, "sweep increased memory");
+    g->gc.estimate -= old - g->gc.total;
+    if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {  /* End of userdata sublist. */
+      g->gc.state = GCSsweep;
+      setmref(g->gc.sweep, &g->gc.root);  /* Continue sweeping the rest of the heap. */
+    }
+    return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSsweep: {
     GCSize old = g->gc.total;
@@ -792,7 +796,8 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
   }
-  while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
+  while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweepudata ||
+	 g->gc.state == GCSsweep)
     gc_onestep(L);  /* Finish sweep. */
   lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
 	     "bad GC state");
