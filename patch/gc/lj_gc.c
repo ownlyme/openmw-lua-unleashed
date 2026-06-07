@@ -146,7 +146,14 @@ size_t lj_gc_separateudata(global_State *g, int all)
   GCobj *o;
   while ((o = gcref(*p)) != NULL) {
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
-      p = &o->gch.nextgc;  /* Nothing to do. */
+      GCtab *mt = tabref(gco2ud(o)->metatable);
+      if (mt && !isfinalized(gco2ud(o)) && !lj_meta_fastg(g, mt, MM_gc)) {
+	*p = o->gch.nextgc;  /* Live, no __gc: relink onto g->gc.root, off the walk for life. */
+	setgcrefr(o->gch.nextgc, g->gc.root);
+	setgcref(g->gc.root, o);
+      } else {
+	p = &o->gch.nextgc;  /* Finalizable, already finalized, or no metatable yet: leave it. */
+      }
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
       markfinalized(o);  /* Done, as there's no __gc metamethod. */
       p = &o->gch.nextgc;
