@@ -1,4 +1,4 @@
-name: build-unsandboxed-luajit
+name: gc-build
 
 on:
   workflow_dispatch:
@@ -9,6 +9,10 @@ env:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox: [sandboxed, unsandboxed]
     steps:
       - uses: actions/checkout@v4
       - name: clone + pin upstream luajit
@@ -16,20 +20,31 @@ jobs:
           git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
           git -C luajit checkout "$LUAJIT_COMMIT"
       - name: apply unsandbox patch
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         run: cp patch/lib_base.c luajit/src/lib_base.c
+      - name: apply gc stage source
+        run: cp patch/gc/*.c patch/gc/*.h luajit/src/
       - name: build
         run: make -C luajit -j"$(nproc)"
       - name: name the drop-in
         run: cp luajit/src/libluajit.so libluajit-5.1.so.2
-      - name: sanity
+      - name: sanity (unsandboxed)
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         run: ./luajit/src/luajit -e 'print(_VERSION); local S = select("sandbox.bypass"); print(type(S), type(S.io), type(S.ffi), type(S.shared))'
+      - name: sanity (sandboxed)
+        if: ${{ matrix.sandbox == 'sandboxed' }}
+        run: ./luajit/src/luajit -e 'print(_VERSION)'
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64
+          name: linux-x86_64-${{ matrix.sandbox }}
           path: libluajit-5.1.so.2
 
   macos:
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox: [sandboxed, unsandboxed]
     steps:
       - uses: actions/checkout@v4
       - name: clone + pin upstream luajit
@@ -37,22 +52,33 @@ jobs:
           git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
           git -C luajit checkout "$LUAJIT_COMMIT"
       - name: apply unsandbox patch
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         run: cp patch/lib_base.c luajit/src/lib_base.c
+      - name: apply gc stage source
+        run: cp patch/gc/*.c patch/gc/*.h luajit/src/
       - name: build
         run: MACOSX_DEPLOYMENT_TARGET=11.0 make -C luajit -j"$(sysctl -n hw.ncpu)"
       - name: name the drop-in
         run: |
           cp luajit/src/libluajit.so libluajit.dylib
           install_name_tool -id libluajit.dylib libluajit.dylib
-      - name: sanity
+      - name: sanity (unsandboxed)
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         run: ./luajit/src/luajit -e 'print(_VERSION); local S = select("sandbox.bypass"); print(type(S.ffi), type(S.shared))'
+      - name: sanity (sandboxed)
+        if: ${{ matrix.sandbox == 'sandboxed' }}
+        run: ./luajit/src/luajit -e 'print(_VERSION)'
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64
+          name: macos-arm64-${{ matrix.sandbox }}
           path: libluajit.dylib
 
   windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox: [sandboxed, unsandboxed]
     steps:
       - uses: actions/checkout@v4
       - name: clone + pin upstream luajit
@@ -61,50 +87,75 @@ jobs:
           git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
           git -C luajit checkout "$LUAJIT_COMMIT"
       - name: apply unsandbox patch
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         shell: cmd
         run: copy /Y patch\lib_base.c luajit\src\lib_base.c
+      - name: apply gc stage source
+        shell: cmd
+        run: copy /Y patch\gc\*.c luajit\src\ && copy /Y patch\gc\*.h luajit\src\
       - uses: ilammy/msvc-dev-cmd@v1
       - name: build
         shell: cmd
         run: cd luajit\src && msvcbuild.bat
-      - name: sanity
+      - name: sanity (unsandboxed)
+        if: ${{ matrix.sandbox == 'unsandboxed' }}
         shell: cmd
         run: luajit\src\luajit.exe -e "print(_VERSION); local S = select('sandbox.bypass'); print(type(S.ffi), type(S.shared))"
+      - name: sanity (sandboxed)
+        if: ${{ matrix.sandbox == 'sandboxed' }}
+        shell: cmd
+        run: luajit\src\luajit.exe -e "print(_VERSION)"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: windows-x86_64-${{ matrix.sandbox }}
           path: luajit/src/lua51.dll
 
   release:
     needs: [linux, macos, windows]
-    if: github.ref == 'refs/heads/stock-gc'
+    if: ${{ github.ref_name == 'good-gc' || github.ref_name == 'better-gc' || github.ref_name == 'extreme-gc' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - name: collect drop-ins
         run: |
           mkdir -p release
-          cp artifacts/windows-x86_64/lua51.dll        release/
-          cp artifacts/linux-x86_64/libluajit-5.1.so.2 release/
-          cp artifacts/macos-arm64/libluajit.dylib     release/
+          for v in sandboxed unsandboxed; do
+            cp artifacts/windows-x86_64-$v/lua51.dll        release/$v-lua51.dll
+            cp artifacts/linux-x86_64-$v/libluajit-5.1.so.2 release/$v-libluajit-5.1.so.2
+            cp artifacts/macos-arm64-$v/libluajit.dylib     release/$v-libluajit.dylib
+          done
           ls -l release
-      - name: publish rolling release
+      - name: stage title
+        id: meta
+        run: |
+          case "${{ github.ref_name }}" in
+            good-gc)    echo "title=Good GC" >> "$GITHUB_OUTPUT" ;;
+            better-gc)  echo "title=Better GC" >> "$GITHUB_OUTPUT" ;;
+            extreme-gc) echo "title=Extreme GC" >> "$GITHUB_OUTPUT" ;;
+            *)          echo "title=${{ github.ref_name }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: publish stage release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: stock-gc
-          name: Stock GC
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.meta.outputs.title }}
           body: |
-            Drop-in unsandboxed LuaJIT for OpenMW 0.51, rebuilt from pinned upstream
-            commit ${{ env.LUAJIT_COMMIT }} (stamps LuaJIT 2.1.1767980792).
+            ${{ steps.meta.outputs.title }} stage drop-in LuaJIT for OpenMW 0.51,
+            rebuilt from pinned upstream commit ${{ env.LUAJIT_COMMIT }}.
 
-            | platform | download | install as |
-            |---|---|---|
-            | windows x86_64 | lua51.dll | lua51.dll |
-            | linux x86_64 | libluajit-5.1.so.2 | libluajit-5.1.so.2 |
-            | macos arm64 | libluajit.dylib | libluajit.dylib |
+            Each platform ships a sandboxed and an unsandboxed build. The
+            `unsandboxed-` assets expose `sandbox.bypass` (io/ffi/shared); the
+            `sandboxed-` assets are the locked-down default.
+
+            | platform | sandboxed | unsandboxed | install as |
+            |---|---|---|---|
+            | windows x86_64 | sandboxed-lua51.dll | unsandboxed-lua51.dll | lua51.dll |
+            | linux x86_64 | sandboxed-libluajit-5.1.so.2 | unsandboxed-libluajit-5.1.so.2 | libluajit-5.1.so.2 |
+            | macos arm64 | sandboxed-libluajit.dylib | unsandboxed-libluajit.dylib | libluajit.dylib |
           files: release/*
           fail_on_unmatched_files: true
