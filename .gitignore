@@ -1,0 +1,7 @@
+luajit/
+*.dll
+*.so
+*.so.2
+*.dylib
+*.lib
+*.log

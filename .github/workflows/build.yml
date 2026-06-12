@@ -1,0 +1,109 @@
+name: build-unsandboxed-luajit
+
+on:
+  workflow_dispatch:
+
+env:
+  LUAJIT_COMMIT: 707c12bf00dafdfd3899b1a6c36435dbbf6c7022
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone + pin upstream luajit
+        run: |
+          git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
+          git -C luajit checkout "$LUAJIT_COMMIT"
+      - name: apply unsandbox patch
+        run: cp patch/lib_base.c luajit/src/lib_base.c
+      - name: build
+        run: make -C luajit -j"$(nproc)"
+      - name: name the drop-in
+        run: cp luajit/src/libluajit.so libluajit-5.1.so.2
+      - name: sanity
+        run: ./luajit/src/luajit -e 'print(_VERSION); local S = select("sandbox.bypass"); print(type(S), type(S.io), type(S.ffi), type(S.shared))'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: libluajit-5.1.so.2
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone + pin upstream luajit
+        run: |
+          git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
+          git -C luajit checkout "$LUAJIT_COMMIT"
+      - name: apply unsandbox patch
+        run: cp patch/lib_base.c luajit/src/lib_base.c
+      - name: build
+        run: MACOSX_DEPLOYMENT_TARGET=11.0 make -C luajit -j"$(sysctl -n hw.ncpu)"
+      - name: name the drop-in
+        run: |
+          cp luajit/src/libluajit.so libluajit.dylib
+          install_name_tool -id libluajit.dylib libluajit.dylib
+      - name: sanity
+        run: ./luajit/src/luajit -e 'print(_VERSION); local S = select("sandbox.bypass"); print(type(S.ffi), type(S.shared))'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: libluajit.dylib
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone + pin upstream luajit
+        shell: bash
+        run: |
+          git clone --branch v2.1 https://github.com/LuaJIT/LuaJIT.git luajit
+          git -C luajit checkout "$LUAJIT_COMMIT"
+      - name: apply unsandbox patch
+        shell: cmd
+        run: copy /Y patch\lib_base.c luajit\src\lib_base.c
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: build
+        shell: cmd
+        run: cd luajit\src && msvcbuild.bat
+      - name: sanity
+        shell: cmd
+        run: luajit\src\luajit.exe -e "print(_VERSION); local S = select('sandbox.bypass'); print(type(S.ffi), type(S.shared))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: luajit/src/lua51.dll
+
+  release:
+    needs: [linux, macos, windows]
+    if: github.ref == 'refs/heads/stock-gc'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect drop-ins
+        run: |
+          mkdir -p release
+          cp artifacts/windows-x86_64/lua51.dll        release/
+          cp artifacts/linux-x86_64/libluajit-5.1.so.2 release/
+          cp artifacts/macos-arm64/libluajit.dylib     release/
+          ls -l release
+      - name: publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1-stock-gc
+          name: Stock GC
+          body: |
+            Unsandboxed LuaJIT for OpenMW 0.51.
+
+            | platform | download | install as |
+            |---|---|---|
+            | windows x86_64 | lua51.dll | lua51.dll |
+            | linux x86_64 | libluajit-5.1.so.2 | libluajit-5.1.so.2 |
+            | macos arm64 | libluajit.dylib | libluajit.dylib |
+          files: release/*
+          fail_on_unmatched_files: true
