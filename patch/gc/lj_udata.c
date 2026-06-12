@@ -9,6 +9,7 @@
 #include "lj_obj.h"
 #include "lj_gc.h"
 #include "lj_err.h"
+#include "lj_meta.h"
 #include "lj_udata.h"
 
 GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
@@ -30,6 +31,26 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
+  /* Has an un-run __gc? Divert to the finalizer queue instead of freeing (cf. lj_cdata_free).
+  ** Userdata are swept before tables (GCSsweepudata), so the metatable is still live here -
+  ** makewhite keeps it through this cycle's table sweep and the __gc call (gc_finalize). */
+  GCtab *mt = tabref(ud->metatable);
+  if (!(ud->marked & LJ_GC_FINALIZED) && lj_meta_fastg(g, mt, MM_gc)) {
+    GCobj *o = obj2gco(ud);
+    GCobj *root = gcref(g->gc.mmudata);
+    makewhite(g, o);
+    markfinalized(o);
+    makewhite(g, obj2gco(mt));  /* Resurrect the metatable for this finalize cycle. */
+    if (root != NULL) {
+      setgcrefr(ud->nextgc, root->gch.nextgc);
+      setgcref(root->gch.nextgc, o);
+      setgcref(g->gc.mmudata, o);
+    } else {
+      setgcref(ud->nextgc, o);
+      setgcref(g->gc.mmudata, o);
+    }
+    return;
+  }
   lj_mem_free(g, ud, sizeudata(ud));
 }
 

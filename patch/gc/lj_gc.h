@@ -10,7 +10,8 @@
 
 /* Garbage collector states. Order matters. */
 enum {
-  GCSpause, GCSpropagate, GCSatomic, GCSsweepstring, GCSsweep, GCSfinalize
+  GCSpause, GCSpropagate, GCSatomic, GCSsweepstring, GCSsweepudata, GCSsweep,
+  GCSfinalize
 };
 
 /* Bitmasks for marked field of GCobj. */

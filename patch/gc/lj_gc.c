@@ -146,14 +146,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
   GCobj *o;
   while ((o = gcref(*p)) != NULL) {
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
-      GCtab *mt = tabref(gco2ud(o)->metatable);
-      if (mt && !isfinalized(gco2ud(o)) && !lj_meta_fastg(g, mt, MM_gc)) {
-	*p = o->gch.nextgc;  /* Live, no __gc: relink onto g->gc.root, off the walk for life. */
-	setgcrefr(o->gch.nextgc, g->gc.root);
-	setgcref(g->gc.root, o);
-      } else {
-	p = &o->gch.nextgc;  /* Finalizable, already finalized, or no metatable yet: leave it. */
-      }
+      p = &o->gch.nextgc;  /* Nothing to do. */
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
       markfinalized(o);  /* Done, as there's no __gc metamethod. */
       p = &o->gch.nextgc;
@@ -406,15 +399,15 @@ static const GCFreeFunc gc_freefunc[] = {
 };
 
 /* Full sweep of a GC list. */
-#define gc_fullsweep(g, p)	gc_sweep(g, (p), ~(uint32_t)0)
+#define gc_fullsweep(g, p)	gc_sweep(g, (p), ~(uint32_t)0, NULL)
 
-/* Partial sweep of a GC list. */
-static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
+/* Partial sweep of a GC list. Stops early when the stop object is reached. */
+static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim, GCobj *stop)
 {
   /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
   int ow = otherwhite(g);
   GCobj *o;
-  while ((o = gcref(*p)) != NULL && lim-- > 0) {
+  while ((o = gcref(*p)) != NULL && o != stop && lim-- > 0) {
     if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
       gc_fullsweep(g, &gco2th(o)->openupval);
     if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* Black or current white? */
@@ -570,9 +563,9 @@ static void gc_finalize(lua_State *L)
     return;
   }
 #endif
-  /* Relink onto g->gc.root, not the udata sublist, so separate() never re-walks it - sweep still frees it. */
-  setgcrefr(o->gch.nextgc, g->gc.root);
-  setgcref(g->gc.root, o);
+  /* Add userdata back to the main userdata list and make it white. */
+  setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
+  setgcref(mainthread(g)->nextgc, o);
   makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
@@ -625,7 +618,7 @@ void lj_gc_freeall(global_State *g)
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
-  size_t udsize;
+  size_t udsize = 0;  /* Finalizer separation moved out of atomic into the incremental sweep (stage 2). */
 
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
@@ -642,9 +635,7 @@ static void atomic(global_State *g, lua_State *L)
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
 
-  udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
-  gc_mark_mmudata(g);  /* Mark them. */
-  udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+  /* Finalizable userdata are now detected incrementally in the sweep phase (see lj_udata_free). */
 
   /* All marking done, clear weak tables. */
   gc_clearweak(g, gcref(g->gc.weak));
@@ -681,18 +672,36 @@ static size_t gc_onestep(lua_State *L)
   case GCSsweepstring: {
     GCSize old = g->gc.total;
     gc_sweepstr(g, &g->str.tab[g->gc.sweepstr++]);  /* Sweep one chain. */
-    if (g->gc.sweepstr > g->str.mask)
-      g->gc.state = GCSsweep;  /* All string hash chains sweeped. */
+    if (g->gc.sweepstr > g->str.mask) {
+      g->gc.state = GCSsweepudata;  /* Sweep userdata before tables, while finalizer metatables are still live. */
+      setmref(g->gc.sweep, &mainthread(g)->nextgc);
+    }
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     return GCSWEEPCOST;
     }
-  case GCSsweep: {
+  case GCSsweepudata: {  /* Stage 2: sweep the userdata sublist first - lj_udata_free diverts the __gc ones. */
     GCSize old = g->gc.total;
-    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX, NULL));
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
-    if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
+    if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {  /* End of userdata sublist. */
+      g->gc.state = GCSsweep;
+      setmref(g->gc.sweep, &g->gc.root);  /* Continue sweeping the rest of the heap. */
+    }
+    return GCSWEEPMAX*GCSWEEPCOST;
+    }
+  case GCSsweep: {
+    GCSize old = g->gc.total;
+    GCobj *th = obj2gco(mainthread(g));
+    GCobj *o;
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX, th));
+    lj_assertG(old >= g->gc.total, "sweep increased memory");
+    g->gc.estimate -= old - g->gc.total;
+    o = gcref(*mref(g->gc.sweep, GCRef));
+    if (o == th || o == NULL) {
+      if (o == th)
+	gc_sweep(g, mref(g->gc.sweep, GCRef), 1, NULL);  /* Sweep the main thread itself. */
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
       if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */
@@ -729,18 +738,30 @@ static size_t gc_onestep(lua_State *L)
 int LJ_FASTCALL lj_gc_step(lua_State *L)
 {
   global_State *g = G(L);
-  GCSize lim;
+  GCSize lim, excess;
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
-  lim = (GCSTEPSIZE/100) * g->gc.stepmul;
+  /* 1/3 stepmul while the collector keeps up */
+  lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 3);
+  excess = g->gc.total > g->gc.estimate ?
+	   (g->gc.total - g->gc.estimate) >> 20 : 0;
+  if (excess > 256) excess = 256;
+  if (excess > 128)
+    lim += lim*2*(excess-128)/128;
   if (lim == 0)
     lim = LJ_MAX_MEM;
-  if (g->gc.total > g->gc.threshold)
+  if (g->gc.total > g->gc.threshold) {
     g->gc.debt += g->gc.total - g->gc.threshold;
+    if (g->gc.debt > GCSTEPSIZE*256)
+      g->gc.debt = GCSTEPSIZE*256;
+  }
   do {
     lim -= (GCSize)gc_onestep(L);
     if (g->gc.state == GCSpause) {
+      /* cap the pause delay at 128MB, where the ramp starts */
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+      if (g->gc.threshold > g->gc.estimate + ((GCSize)128 << 20))
+	g->gc.threshold = g->gc.estimate + ((GCSize)128 << 20);
       g->vmstate = ostate;
       return 1;  /* Finished a GC cycle. */
     }
@@ -792,7 +813,8 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
   }
-  while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
+  while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweepudata ||
+	 g->gc.state == GCSsweep)
     gc_onestep(L);  /* Finish sweep. */
   lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
 	     "bad GC state");
@@ -800,6 +822,8 @@ void lj_gc_fullgc(lua_State *L)
   g->gc.state = GCSpause;
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+  if (g->gc.threshold > g->gc.estimate + ((GCSize)128 << 20))
+    g->gc.threshold = g->gc.estimate + ((GCSize)128 << 20);
   g->vmstate = ostate;
 }
 
