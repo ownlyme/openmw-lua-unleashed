@@ -563,9 +563,9 @@ static void gc_finalize(lua_State *L)
     return;
   }
 #endif
-  /* Add userdata back to the main userdata list and make it white. */
-  setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
-  setgcref(mainthread(g)->nextgc, o);
+  /* Relink onto g->gc.root, not the udata sublist, so separate() never re-walks it - sweep still frees it. */
+  setgcrefr(o->gch.nextgc, g->gc.root);
+  setgcref(g->gc.root, o);
   makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
