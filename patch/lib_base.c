@@ -284,17 +284,15 @@ LJLIB_CF(select)		LJLIB_REC(.)
       static const char banner[] = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
       static char seen[64][LUA_IDSIZE];
       static int seen_count = 0;
-      for (level = 1; lua_getstack(L, level, &ar) && lua_getinfo(L, "Slf", &ar); level++) {
-	if (*ar.what == 'C') {
-	  lua_pop(L, 1);
+      for (level = 1; lua_getstack(L, level, &ar) && lua_getinfo(L, "Sl", &ar); level++) {
+	if (*ar.what == 'C')
 	  continue;
-	}
 	src = ar.short_src;
 	line = ar.currentline;
 	/* once per mod */
 	for (i = 0; i < seen_count; i++)
 	  if (strcmp(seen[i], src) == 0) { handled = 1; break; }
-	if (handled) { lua_pop(L, 1); break; }
+	if (handled) break;
 	if (seen_count < (int)(sizeof(seen)/sizeof(seen[0]))) {
 	  strncpy(seen[seen_count], src, LUA_IDSIZE - 1);
 	  seen[seen_count][LUA_IDSIZE - 1] = '\0';
@@ -302,21 +300,21 @@ LJLIB_CF(select)		LJLIB_REC(.)
 	}
 	script_color(src, col);
 	snprintf(msg, sizeof(msg),
-		"\n\n%s %s\n%s sandbox.bypass accessed by %s:%d\n%s %s\n",
+		"\n%s %s\n%s sandbox.bypass accessed by %s:%d\n%s %s\n",
 		col, banner, col, src, line, col, banner);
-	lua_getfenv(L, -1);
-	lua_getfield(L, -1, "print");
+	/* engine logger from the thread globals - the sandbox can't reach it, so a mod can't wrap or mute it like print */
+	lua_getglobal(L, "writeToLog");
 	if (lua_isfunction(L, -1)) {
-	  lua_pushvalue(L, -1);
 	  lua_pushstring(L, msg);
 	  if (lua_pcall(L, 1, 0, 0) != 0) lua_pop(L, 1);
 	  handled = 1;
+	} else {
+	  lua_pop(L, 1);
 	}
-	lua_pop(L, 3);
 	break;
       }
       if (!handled)
-	fprintf(stderr, "\n\n%s\nsandbox.bypass accessed by %s:%d\n%s\n\n", banner, src, line, banner);
+	fprintf(stderr, "\n%s\nsandbox.bypass accessed by %s:%d\n%s\n\n", banner, src, line, banner);
     }
     lua_getglobal(L, LUA_IOLIBNAME);
     if (lua_isnil(L, -1)) {
