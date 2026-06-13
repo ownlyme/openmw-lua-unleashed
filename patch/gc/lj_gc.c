@@ -9,6 +9,9 @@
 #define lj_gc_c
 #define LUA_CORE
 
+/* stdio only for the disabled gc debug print in lj_gc_step */
+/* #include <stdio.h> */
+
 #include "lj_obj.h"
 #include "lj_gc.h"
 #include "lj_err.h"
@@ -30,7 +33,7 @@
 #include "lj_vmevent.h"
 
 #define GCSTEPSIZE	1024u
-#define GCSWEEPMAX	40
+#define GCSWEEPMAX	16
 #define GCSWEEPCOST	10
 #define GCFINALIZECOST	100
 
@@ -738,16 +741,38 @@ static size_t gc_onestep(lua_State *L)
 int LJ_FASTCALL lj_gc_step(lua_State *L)
 {
   global_State *g = G(L);
-  GCSize lim, excess;
+  GCSize lim;
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
-  /* 1/3 stepmul while the collector keeps up */
-  lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 3);
-  excess = g->gc.total > g->gc.estimate ?
-	   (g->gc.total - g->gc.estimate) >> 20 : 0;
-  if (excess > 256) excess = 256;
-  if (excess > 128)
-    lim += lim*2*(excess-128)/128;
+  /* different sweep speeds for each phase */
+  if (g->gc.state == GCSsweepudata)
+    lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 25);
+  else if (g->gc.state == GCSsweepstring)
+    lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 10);
+  else if (g->gc.state == GCSsweep)
+    lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 5);
+  else
+    lim = (GCSTEPSIZE/100) * g->gc.stepmul;
+  
+#if 0  /* gc debug print - per-phase stepmul logging */
+  GCSize excess = g->gc.total > g->gc.estimate ?
+	   (g->gc.total - g->gc.estimate) >> 20 : 0;  /* allocated since mark */
+  {
+    static const char *const phase[] = {
+      "pause", "mark", "atomic", "sweepstr", "sweepud", "sweep", "finalize"
+    };
+    unsigned totmb = (unsigned)(g->gc.total >> 20);
+    unsigned exmb = (unsigned)excess;
+    unsigned stepmul = (unsigned)(lim / (GCSTEPSIZE/100));
+    static unsigned last_tot = ~0u, last_ex = ~0u, last_mul = ~0u, last_st = ~0u;
+    if (totmb != last_tot || exmb != last_ex || stepmul != last_mul || g->gc.state != last_st) {
+      last_tot = totmb; last_ex = exmb; last_mul = stepmul; last_st = g->gc.state;
+      fprintf(stderr, "[gc] %-8s total=%uMB excess=%uMB stepmul=%u%%\n",
+	      phase[g->gc.state], totmb, exmb, stepmul);
+    }
+  }
+#endif
+
   if (lim == 0)
     lim = LJ_MAX_MEM;
   if (g->gc.total > g->gc.threshold) {
@@ -758,10 +783,10 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
   do {
     lim -= (GCSize)gc_onestep(L);
     if (g->gc.state == GCSpause) {
-      /* cap the pause delay at 128MB, where the ramp starts */
+      /* cap the next cycle start at 96MB above the live estimate */
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
-      if (g->gc.threshold > g->gc.estimate + ((GCSize)128 << 20))
-	g->gc.threshold = g->gc.estimate + ((GCSize)128 << 20);
+      if (g->gc.threshold > g->gc.estimate + ((GCSize)96 << 20))
+	g->gc.threshold = g->gc.estimate + ((GCSize)96 << 20);
       g->vmstate = ostate;
       return 1;  /* Finished a GC cycle. */
     }
@@ -822,8 +847,8 @@ void lj_gc_fullgc(lua_State *L)
   g->gc.state = GCSpause;
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
-  if (g->gc.threshold > g->gc.estimate + ((GCSize)128 << 20))
-    g->gc.threshold = g->gc.estimate + ((GCSize)128 << 20);
+  if (g->gc.threshold > g->gc.estimate + ((GCSize)96 << 20))
+    g->gc.threshold = g->gc.estimate + ((GCSize)96 << 20);
   g->vmstate = ostate;
 }
 

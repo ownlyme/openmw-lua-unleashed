@@ -90,9 +90,9 @@
 /* Various tunables. */
 #define LUAI_MAXSTACK	65500	/* Max. # of stack slots for a thread (<64K). */
 #define LUAI_MAXCSTACK	8000	/* Max. # of stack slots for a C func (<10K). */
-#define LUAI_GCPAUSE	200	/* Pause GC until memory is at 200%. */
-#define LUAI_GCMUL	120	/* Full-ramp GC step ceiling (% of GCSTEPSIZE); floor is 1/3 of this. */
-#define LUA_MAXCAPTURES	32	/* Max. pattern captures. */
+#define LUAI_GCPAUSE	200		/* Pause GC until memory is at 200%. */
+#define LUAI_GCMUL		200		/* Full GC step speed (% of GCSTEPSIZE); sweep phases run at fractions, see lj_gc_step. */
+#define LUA_MAXCAPTURES	32		/* Max. pattern captures. */
 
 /* Configuration for the frontend (the luajit executable). */
 #if defined(luajit_c)
