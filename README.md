@@ -101,9 +101,9 @@ Each stage shrinks it a different way:
 
 Extreme can get away with that because of a quirk in how OpenMW writes its finalizers: every `__gc` is a leaf C++ destructor. It frees a native handle and never reads another Lua object, so running one can't drag anything back from the dead. That lets the collector skip the "stop-the-world bookkeeping" it would otherwise need to keep a finalizer's dependencies alive.
 
-The one thing it still needs is each dying userdata's own metatable, since that's where `__gc` actually lives. So Extreme sweeps userdata before tables and briefly revives just that metatable for the one cycle it's needed before letting it go.
+The one thing it still needs is each dying userdata's own metatable, since that's where `__gc` actually lives. So Extreme sweeps userdata before tables.
 
-Extreme also splits the GC stepmul by phase: full (200%) everywhere except the throttled sweeps - string 1/10, heap 1/5, userdata 1/25.
+Extreme also splits the GC stepmul by phase: full (200%) everywhere except the throttled sweeps - string 1/5, heap 1/5, userdata 1/10.
 
 ## Compiling
 
