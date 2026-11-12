@@ -32,15 +32,20 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
   /* Has an un-run __gc? Divert to the finalizer queue instead of freeing (cf. lj_cdata_free).
-  ** Userdata are swept before tables (GCSsweepudata), so the metatable is still live here -
-  ** makewhite keeps it through this cycle's table sweep and the __gc call (gc_finalize). */
+  ** Userdata are swept before tables (GCSsweepudata), so the metatable is not freed yet here.
+  ** A live metatable survives the table sweep by itself.
+  ** lj_gc_freeall sweeps tables first, so on shutdown the metatable may already be freed. */
   GCtab *mt = tabref(ud->metatable);
-  if (!(ud->marked & LJ_GC_FINALIZED) && lj_meta_fastg(g, mt, MM_gc)) {
+  /* A metatable that is itself dead (nothing but dying userdata held it) died with everything it refers to, its __gc
+  ** function included, and those are freed later in this sweep (strings already were). Reviving the table alone would
+  ** call a freed finalizer, so such a userdata is freed as if it had none. OpenMW's metatables with a __gc live in the registry and
+  ** are never dead here; a script's newproxy(true) with its own metatable is. */
+  if (mt && !(g->gc.currentwhite & LJ_GC_SFIXED) && !(ud->marked & LJ_GC_FINALIZED) &&
+      !isdead(g, obj2gco(mt)) && lj_meta_fastg(g, mt, MM_gc)) {
     GCobj *o = obj2gco(ud);
     GCobj *root = gcref(g->gc.mmudata);
     makewhite(g, o);
     markfinalized(o);
-    makewhite(g, obj2gco(mt));  /* Resurrect the metatable for this finalize cycle. */
     if (root != NULL) {
       setgcrefr(ud->nextgc, root->gch.nextgc);
       setgcref(root->gch.nextgc, o);

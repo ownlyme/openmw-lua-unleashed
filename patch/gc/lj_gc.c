@@ -638,7 +638,11 @@ static void atomic(global_State *g, lua_State *L)
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
 
-  /* Finalizable userdata are now detected incrementally in the sweep phase (see lj_udata_free). */
+  /* Finalizable userdata are now detected incrementally in the sweep phase (see lj_udata_free).
+  ** The queue is empty here unless lj_gc_fullgc restarted the cycle mid-finalize.
+  ** Leftovers are on no sweep list, and unmarked their metatables get freed before their __gc runs. */
+  gc_mark_mmudata(g);
+  gc_propagate_gray(g);
 
   /* All marking done, clear weak tables. */
   gc_clearweak(g, gcref(g->gc.weak));
@@ -676,7 +680,7 @@ static size_t gc_onestep(lua_State *L)
     GCSize old = g->gc.total;
     gc_sweepstr(g, &g->str.tab[g->gc.sweepstr++]);  /* Sweep one chain. */
     if (g->gc.sweepstr > g->str.mask) {
-      g->gc.state = GCSsweepudata;  /* Sweep userdata before tables, while finalizer metatables are still live. */
+      g->gc.state = GCSsweepudata;  /* Sweep userdata before tables, while finalizer metatables are not freed yet. */
       setmref(g->gc.sweep, &mainthread(g)->nextgc);
     }
     lj_assertG(old >= g->gc.total, "sweep increased memory");
@@ -744,11 +748,13 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
   GCSize lim;
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
-  /* different sweep speeds for each phase */
+  /* different sweep speeds for each phase
+  ** the userdata sweep moves in whole chunks of GCSWEEPMAX, at the default stepmul /10 is 2 chunks per step
+  ** 1 chunk (/25) falls behind heavy modlists, every finalized userdata needs two visits */
   if (g->gc.state == GCSsweepudata)
-    lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 25);
-  else if (g->gc.state == GCSsweepstring)
     lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 10);
+  else if (g->gc.state == GCSsweepstring)
+    lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 5);
   else if (g->gc.state == GCSsweep)
     lim = (GCSTEPSIZE/100) * (g->gc.stepmul / 5);
   else
